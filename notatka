@@ -1,0 +1,240 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace GameOfLife.Services // Upewnij się, że namespace pasuje do Twojego projektu
+{
+    public class FileService
+    {
+        // Metoda 1: Asynchroniczne enumerowanie plików
+        public async IAsyncEnumerable<string> EnumerateFilesAsync(string folderPath, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken token)
+        {
+            // Pobieramy enumerable (leniwie), szukamy tylko plików .txt
+            var files = Directory.EnumerateFiles(folderPath, "*.txt");
+
+            foreach (var file in files)
+            {
+                // Sprawdzenie czy zażądano anulowania
+                if (token.IsCancellationRequested)
+                {
+                    yield break;
+                }
+
+                // Sztuczne opóźnienie dla efektu wizualnego w UI (zgodnie z poleceniem)
+                await Task.Delay(100, token);
+
+                yield return file;
+            }
+        }
+
+        // Metoda 2: Asynchroniczne wczytywanie planszy
+        public async Task<bool[,]> LoadBoardAsync(string filePath, int rows, int cols)
+        {
+            var board = new bool[rows, cols];
+            
+            // Wczytanie wszystkich linii asynchronicznie
+            string[] lines = await File.ReadAllLinesAsync(filePath);
+
+            for (int y = 0; y < rows; y++)
+            {
+                // Zabezpieczenie: jeśli plik ma mniej wierszy niż plansza
+                if (y >= lines.Length) break;
+
+                string line = lines[y];
+                for (int x = 0; x < cols; x++)
+                {
+                    // Zabezpieczenie: jeśli linia jest krótsza niż szerokość planszy
+                    if (x >= line.Length) break;
+
+                    // Zgodnie z poleceniem: '0' to żywa komórka (true), reszta martwa (false)
+                    if (line[x] == '0')
+                    {
+                        board[y, x] = true;
+                    }
+                    else
+                    {
+                        board[y, x] = false;
+                    }
+                }
+            }
+
+            return board;
+        }
+    }
+}
+// etap 2
+using System.Diagnostics;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace GameOfLife.Models
+{
+    public partial class LifeEngine
+    {
+        // Zakładam, że te pola istnieją w klasie (na podstawie metod LoadState/Grid)
+        // public bool[,] Grid { get; private set; }
+        // private int _rows;
+        // private int _cols;
+
+        public SimulationStepResult CalculateNextGeneration(CancellationToken token)
+        {
+            var stopwatch = Stopwatch.StartNew();
+            int livingCellsCount = 0;
+
+            // Tworzymy nową tablicę na następny stan
+            bool[,] nextGrid = new bool[_rows, _cols];
+
+            var parallelOptions = new ParallelOptions
+            {
+                CancellationToken = token,
+                // Opcjonalnie: MaxDegreeOfParallelism = Environment.ProcessorCount
+            };
+
+            // Równoległe przetwarzanie wierszy
+            Parallel.For(0, _rows, parallelOptions, y =>
+            {
+                for (int x = 0; x < _cols; x++)
+                {
+                    // Pobranie liczby sąsiadów (metoda istnieje w klasie zgodnie z opisem)
+                    int neighbors = CountLiveNeighbors(y, x);
+                    bool isAlive = Grid[y, x];
+                    bool nextState = false;
+
+                    // Zasady gry
+                    if (isAlive)
+                    {
+                        // Przeżycie: 2 lub 3 sąsiadów
+                        if (neighbors == 2 || neighbors == 3)
+                            nextState = true;
+                    }
+                    else
+                    {
+                        // Narodziny: dokładnie 3 sąsiadów
+                        if (neighbors == 3)
+                            nextState = true;
+                    }
+
+                    nextGrid[y, x] = nextState;
+
+                    // Bezpieczne zliczanie żywych komórek w pętli równoległej
+                    if (nextState)
+                    {
+                        Interlocked.Add(ref livingCellsCount, 1);
+                    }
+                }
+            });
+
+            // Podmiana tablicy (stara staje się nową)
+            Grid = nextGrid;
+
+            stopwatch.Stop();
+
+            return new SimulationStepResult(livingCellsCount, stopwatch.ElapsedMilliseconds);
+        }
+    }
+}
+//etap3 
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+// using GameOfLife.Models; // Wymagane importy zależne od struktury projektu
+
+namespace GameOfLife.ViewModels
+{
+    public partial class MainWindowViewModel
+    {
+        // Metoda pętli symulacji (uruchamiana w Task.Run)
+        private async Task SimulationLoop(IProgress<SimulationFrame> progress, CancellationToken token)
+        {
+            try
+            {
+                while (!token.IsCancellationRequested)
+                {
+                    // 1. Oblicz nowy stan
+                    // Metoda CalculateNextGeneration w silniku
+                    var stepResult = _engine.CalculateNextGeneration(token);
+
+                    // 2. Raportuj progres
+                    // Klonujemy tablicę, aby UI nie czytało jej w momencie, gdy silnik będzie ją modyfikował w kolejnym kroku
+                    var frame = new SimulationFrame(
+                        (bool[,])_engine.Grid.Clone(),
+                        stepResult.LivingCells,
+                        stepResult.CalculationTimeMs
+                    );
+                    
+                    progress.Report(frame);
+
+                    // 3. Opóźnienie (suwak prędkości)
+                    await Task.Delay(SimulationDelay, token);
+                }
+            }
+            catch (TaskCanceledException)
+            {
+                // Obsługa anulowania - normalne wyjście z pętli
+            }
+        }
+
+        public async Task StartSimulationFromFileAsync(string filePath)
+        {
+            // 1. Przerwanie poprzedniej symulacji
+            if (_simulationCancellationTokenSource != null)
+            {
+                _simulationCancellationTokenSource.Cancel();
+                _simulationCancellationTokenSource.Dispose();
+            }
+            
+            // Jeśli zadanie istnieje, czekamy aż faktycznie się zatrzyma
+            if (_currentSimulationTask != null)
+            {
+                try
+                {
+                    await _currentSimulationTask;
+                }
+                catch (TaskCanceledException)
+                {
+                    // Ignorujemy wyjątek anulowania z poprzedniego zadania
+                }
+            }
+
+            // Tworzymy nowy token dla nowej symulacji
+            _simulationCancellationTokenSource = new CancellationTokenSource();
+            var token = _simulationCancellationTokenSource.Token;
+
+            // Ustawienie statusu
+            StatusText = $"Scanning directory..."; // Lub "Loading..." w zależności od momentu
+            
+            // 2. Ładowanie planszy z pliku (I/O)
+            try 
+            {
+                var loadedBoard = await _fileService.LoadBoardAsync(filePath, BoardSize, BoardSize);
+                
+                // Inicjalizacja silnika
+                _engine.LoadState(loadedBoard);
+                
+                // Reset UI przed startem
+                StatusText = $"Simulation: {System.IO.Path.GetFileName(filePath)}";
+                Generation = 0;
+                CurrentGrid = loadedBoard; // Wyświetl stan początkowy
+            }
+            catch (Exception ex)
+            {
+                StatusText = $"Error loading file: {ex.Message}";
+                return;
+            }
+
+            // 3. Definicja raportowania progresu (to wykona się w wątku UI)
+            var progressHandler = new Progress<SimulationFrame>(frame =>
+            {
+                CurrentGrid = frame.Grid;
+                LiveCells = frame.LivingCells;
+                LastCalculationTimeMs = frame.CalculationTimeMs;
+                Generation++;
+            });
+
+            // 4. Uruchomienie pętli symulacji na wątku puli wątków (bez await!)
+            _currentSimulationTask = Task.Run(() => SimulationLoop(progressHandler, token), token);
+        }
+    }
+}
